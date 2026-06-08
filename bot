@@ -22,7 +22,7 @@ from aiogram.types import InlineKeyboardButton
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = "8758383914:AAEGlke4g7zgNcaa4JZDN6mx8LfArAC5xqM"
+BOT_TOKEN = "8850529667:AAGMq8dSsrQiNug66fCuJo5l_ru8cMmrenQ"
 ADMIN_ID = 5804091236
 ACCOUNTS_FILE = "scanner_accounts.json"
 
