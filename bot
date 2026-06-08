@@ -1,0 +1,686 @@
+import os
+import json
+import asyncio
+import uuid
+import logging
+import time
+import threading
+import ssl
+import socket
+import struct
+import msgpack
+import zipfile
+import requests
+from io import BytesIO
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardButton
+
+logging.basicConfig(level=logging.INFO)
+
+BOT_TOKEN = "8850529667:AAGMq8dSsrQiNug66fCuJo5l_ru8cMmrenQ"
+ADMIN_ID = 5804091236
+ACCOUNTS_FILE = "scanner_accounts.json"
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+# ==================== MAX PROTOCOL ====================
+
+class Packet:
+    VERSION = 10
+    HEADER_SIZE = 10
+
+    def __init__(self, opcode: int, payload: bytes = b"", sequence: int = 0, cmd: int = 0):
+        self.version = self.VERSION
+        self.cmd = cmd
+        self.sequence = sequence
+        self.opcode = opcode
+        self.payload = payload
+
+    def to_bytes(self) -> bytes:
+        payload_bytes = self.payload
+        body_len = len(payload_bytes)
+        flags_and_len = (body_len & 0x00FFFFFF)
+        header = struct.pack(">B B H H I", self.version, self.cmd, 
+                           self.sequence & 0xFFFF, self.opcode & 0xFFFF, flags_and_len)
+        return header + payload_bytes
+
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        if len(data) < cls.HEADER_SIZE:
+            raise ValueError("Too short")
+        header = data[:cls.HEADER_SIZE]
+        version, cmd, sequence, opcode, flags_and_len = struct.unpack(">B B H H I", header)
+        body_len = flags_and_len & 0x00FFFFFF
+        payload = data[cls.HEADER_SIZE:cls.HEADER_SIZE + body_len]
+        return cls(opcode=opcode, payload=payload, sequence=sequence, cmd=cmd)
+
+class Opcode:
+    SESSION_INIT = 6
+    LOGIN = 19
+    AUTH_QR_APPROVE = 290
+
+def pack(data: dict) -> bytes:
+    return msgpack.packb(data, use_bin_type=True)
+
+def unpack(data: bytes) -> dict:
+    try:
+        return msgpack.unpackb(data, raw=False, strict_map_key=False)
+    except Exception:
+        try:
+            unpacker = msgpack.Unpacker(raw=False, strict_map_key=False)
+            unpacker.feed(data)
+            return next(unpacker)
+        except:
+            return {}
+
+class MaxConnection:
+    HOST = "api.oneme.ru"
+    PORT = 443
+
+    def __init__(self):
+        self._sock = None
+        self._sequence = 0
+        self._lock = threading.Lock()
+        self._pending = {}
+        self._responses = {}
+        self._running = False
+        self._buffer = bytearray()
+
+    def connect(self) -> bool:
+        try:
+            plain = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            plain.settimeout(10)
+            plain.connect((self.HOST, self.PORT))
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self._sock = ctx.wrap_socket(plain, server_hostname=self.HOST)
+            self._sock.settimeout(5)
+            self._running = True
+            self._buffer = bytearray()
+            self._pending.clear()
+            self._responses.clear()
+            threading.Thread(target=self._reader, daemon=True).start()
+            logging.info("[CONN] Connected to api.oneme.ru")
+            return True
+        except Exception as e:
+            logging.error(f"[CONN] Connection failed: {e}")
+            return False
+
+    def close(self):
+        self._running = False
+        if self._sock:
+            try: self._sock.close()
+            except: pass
+            self._sock = None
+        logging.info("[CONN] Connection closed")
+
+    def _reader(self):
+        while self._running and self._sock:
+            try:
+                chunk = self._sock.recv(8192)
+                if not chunk: break
+                self._buffer.extend(chunk)
+                self._parse()
+            except socket.timeout: continue
+            except: break
+
+    def _parse(self):
+        while len(self._buffer) >= Packet.HEADER_SIZE:
+            header = bytes(self._buffer[:Packet.HEADER_SIZE])
+            _, _, seq, opcode, flags_and_len = struct.unpack(">B B H H I", header)
+            body_len = flags_and_len & 0x00FFFFFF
+            total = Packet.HEADER_SIZE + body_len
+            
+            if len(self._buffer) < total:
+                break
+            
+            data = bytes(self._buffer[:total])
+            self._buffer = self._buffer[total:]
+            
+            try:
+                packet = Packet.from_bytes(data)
+                if packet.sequence in self._pending:
+                    self._responses[packet.sequence] = packet
+                    self._pending[packet.sequence].set()
+            except Exception as e:
+                logging.debug(f"Parse error (skipping): {e}")
+                continue
+
+    def send(self, packet: Packet, wait=True):
+        with self._lock:
+            self._sequence = (self._sequence + 1) & 0xFFFF
+            packet.sequence = self._sequence
+            seq = packet.sequence
+            if wait:
+                event = threading.Event()
+                self._pending[seq] = event
+                self._responses.pop(seq, None)
+        self._sock.sendall(packet.to_bytes())
+        if not wait: return None
+        if not self._pending[seq].wait(60):
+            self._pending.pop(seq, None)
+            raise TimeoutError(f"Timeout seq {seq}")
+        self._pending.pop(seq, None)
+        return self._responses.pop(seq, None)
+
+class QRScanner:
+    def __init__(self, token: str, device_id: str):
+        self.token = token
+        self.device_id = device_id or str(uuid.uuid4())
+        self.conn = MaxConnection()
+
+    def scan(self, track_id: str, qr_link: str) -> dict:
+        logging.info(f"[SCAN] Starting scan: track_id={track_id}")
+        try:
+            if not self.conn.connect():
+                logging.error("[SCAN] Connection failed")
+                return {"success": False, "error": "Connection failed"}
+            
+            now_ms = int(time.time() * 1000)
+            payload = {
+                "clientSessionId": now_ms & 0x7FFFFFFF,
+                "mt_instanceid": str(uuid.uuid4()),
+                "userAgent": {
+                    "deviceType": "ANDROID",
+                    "appVersion": "26.17.1",
+                    "osVersion": "Android 10",
+                    "timezone": "Europe/Moscow",
+                    "screen": "408dpi 1080x2292",
+                    "pushDeviceType": "GCM",
+                    "arch": "arm64-v8a",
+                    "locale": "ru",
+                    "buildNumber": 6712,
+                    "deviceName": "Google Pixel 7",
+                    "deviceLocale": "ru"
+                },
+                "deviceId": self.device_id
+            }
+            p = Packet(Opcode.SESSION_INIT, pack(payload))
+            self.conn.send(p)
+            time.sleep(0.5)
+            logging.info("[SCAN] Session initialized")
+            
+            login_payload = {
+                "token": self.token,
+                "deviceId": self.device_id,
+                "userAgent": {
+                    "deviceType": "ANDROID",
+                    "appVersion": "26.17.1",
+                    "osVersion": "Android 10",
+                    "timezone": "Europe/Moscow",
+                    "screen": "408dpi 1080x2292",
+                    "pushDeviceType": "GCM",
+                    "arch": "arm64-v8a",
+                    "locale": "ru",
+                    "buildNumber": 6712,
+                    "deviceName": "Google Pixel 7",
+                    "deviceLocale": "ru"
+                }
+            }
+            p = Packet(Opcode.LOGIN, pack(login_payload))
+            resp = self.conn.send(p)
+            data = unpack(resp.payload)
+            logging.info(f"[SCAN] Login response: {str(data)[:200]}")
+            
+            if isinstance(data, dict):
+                if data.get("passwordChallenge"):
+                    logging.warning("[SCAN] 2FA password required")
+                    return {"success": False, "error": "2FA_REQUIRED", "password_challenge": True}
+                if "error" in data:
+                    logging.error(f"[SCAN] Login error: {data['error']}")
+                    return {"success": False, "error": data["error"]}
+            
+            time.sleep(0.5)
+            
+            qr_payload = {"trackId": track_id, "qrLink": qr_link}
+            p = Packet(Opcode.AUTH_QR_APPROVE, pack(qr_payload))
+            resp = self.conn.send(p)
+            logging.info(f"[SCAN] QR approve sent")
+            
+            if resp.payload and len(resp.payload) > 0:
+                data = unpack(resp.payload)
+                logging.info(f"[SCAN] QR approve response: {str(data)[:200]}")
+                if isinstance(data, dict) and "error" in data:
+                    logging.error(f"[SCAN] QR error: {data['error']}")
+                    return {"success": False, "error": data["error"]}
+            
+            logging.info("[SCAN] Success!")
+            return {"success": True}
+            
+        except Exception as e:
+            logging.error(f"[SCAN] Exception: {e}")
+            return {"success": False, "error": str(e)}
+        finally:
+            self.conn.close()
+
+# ==================== ДАННЫЕ ====================
+
+class AuthState(StatesGroup):
+    waiting_for_qr = State()
+
+accounts = {}
+
+def load_accounts():
+    global accounts
+    if os.path.exists(ACCOUNTS_FILE):
+        with open(ACCOUNTS_FILE, "r") as f:
+            accounts = json.load(f)
+        logging.info(f"[DATA] Loaded {len(accounts)} accounts")
+
+def save_accounts():
+    with open(ACCOUNTS_FILE, "w") as f:
+        json.dump(accounts, f, ensure_ascii=False, indent=4)
+    logging.info(f"[DATA] Saved {len(accounts)} accounts")
+
+load_accounts()
+
+def parse_token_json(data: dict) -> dict:
+    token = data.get("token", "")
+    device_id = data.get("deviceId", str(uuid.uuid4()))
+    password = data.get("password", "")
+    
+    user = data.get("user", {})
+    phone = str(user.get("phone", "unknown"))
+    if phone != "unknown":
+        phone = f"+{phone}"
+    
+    return {
+        "token": token,
+        "device_id": device_id,
+        "phone": phone,
+        "password": password
+    }
+
+def add_account_from_json(data: dict) -> bool:
+    parsed = parse_token_json(data)
+    token = parsed["token"]
+    
+    if not token or len(token) < 20:
+        logging.warning(f"[DATA] Skipped invalid token: {str(data)[:100]}")
+        return False
+    
+    acc_id = str(uuid.uuid4())[:8]
+    accounts[acc_id] = {
+        "token": token,
+        "device_id": parsed["device_id"],
+        "phone": parsed["phone"],
+        "password": parsed["password"],
+        "added_at": time.time(),
+        "total_scans": 0
+    }
+    logging.info(f"[DATA] Added account: {parsed['phone']} (id={acc_id})")
+    return True
+
+def process_content(content: str) -> tuple:
+    added = 0
+    skipped = 0
+    
+    try:
+        data = json.loads(content)
+        
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    if add_account_from_json(item):
+                        added += 1
+                    else:
+                        skipped += 1
+            return added, skipped
+        elif isinstance(data, dict):
+            if add_account_from_json(data):
+                added += 1
+            else:
+                skipped += 1
+            return added, skipped
+    except:
+        pass
+    
+    for line in content.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        
+        try:
+            data = json.loads(line)
+            if isinstance(data, dict):
+                if add_account_from_json(data):
+                    added += 1
+                else:
+                    skipped += 1
+                continue
+        except:
+            pass
+        
+        parts = line.split('|')
+        token = parts[0].strip() if len(parts) > 0 else ""
+        
+        if not token or len(token) < 20:
+            skipped += 1
+            continue
+        
+        device_id = parts[1].strip() if len(parts) > 1 else str(uuid.uuid4())
+        phone = parts[2].strip() if len(parts) > 2 else "unknown"
+        
+        acc_id = str(uuid.uuid4())[:8]
+        accounts[acc_id] = {
+            "token": token,
+            "device_id": device_id,
+            "phone": phone,
+            "password": "",
+            "added_at": time.time(),
+            "total_scans": 0
+        }
+        added += 1
+    
+    return added, skipped
+
+def main_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="📷 Отсканировать QR", callback_data="scan_qr"))
+    builder.row(InlineKeyboardButton(text="📊 Мои аккаунты", callback_data="my_stats"))
+    return builder.as_markup()
+
+def admin_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="📷 Отсканировать QR", callback_data="scan_qr"))
+    builder.row(InlineKeyboardButton(text="➕ Загрузить токены", callback_data="upload_tokens"))
+    builder.row(InlineKeyboardButton(text="📊 Статистика", callback_data="stats"))
+    return builder.as_markup()
+
+# ==================== ХЕНДЛЕРЫ ====================
+
+@dp.message(F.text == "/start")
+async def start(message: types.Message):
+    is_admin = message.from_user.id == ADMIN_ID
+    kb = admin_keyboard() if is_admin else main_keyboard()
+    logging.info(f"[USER] /start from {message.from_user.id} (admin={is_admin})")
+    await message.answer(
+        "🤖 <b>QR Scanner Bot</b>\n\n"
+        "Отправьте <b>фото QR-кода</b> и бот отсканирует его через свободный аккаунт.\n\n"
+        "<b>Для админа:</b> отправьте .txt, .json или .zip файл с токенами.",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+# ==================== ЗАГРУЗКА ФАЙЛОВ С ТОКЕНАМИ ====================
+
+@dp.callback_query(F.data == "upload_tokens")
+async def cb_upload_tokens(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("❌ Только для админа", show_alert=True)
+    
+    await callback.message.answer(
+        "📦 Отправьте файл с токенами:\n\n"
+        "Поддерживаемые форматы:\n"
+        "• <b>.json</b> — одиночный токен или массив\n"
+        "• <b>.txt</b> — токены построчно\n"
+        "• <b>.zip</b> — архив с .txt/.json файлами\n\n"
+        "Формат данных как при выгрузке ANDROID из основного бота.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.message(F.document)
+async def handle_document(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    doc = message.document
+    file_name = doc.file_name.lower()
+    logging.info(f"[FILE] Received: {file_name}")
+    
+    if not file_name.endswith(('.txt', '.json', '.zip')):
+        await message.answer("❌ Отправьте файл .txt, .json или .zip")
+        return
+    
+    msg = await message.answer("⏳ Обрабатываю файл...")
+    
+    try:
+        file = await bot.get_file(doc.file_id)
+        file_bytes = await bot.download_file(file.file_path)
+        
+        added = 0
+        skipped = 0
+        
+        if file_name.endswith('.zip'):
+            zip_buffer = BytesIO(file_bytes.read())
+            with zipfile.ZipFile(zip_buffer, 'r') as zf:
+                for inner_file in zf.namelist():
+                    if not inner_file.endswith(('.txt', '.json')):
+                        continue
+                    
+                    try:
+                        content = zf.read(inner_file).decode('utf-8')
+                        a, s = process_content(content)
+                        added += a
+                        skipped += s
+                    except:
+                        skipped += 1
+        else:
+            content = file_bytes.read().decode('utf-8')
+            added, skipped = process_content(content)
+        
+        save_accounts()
+        
+        await msg.edit_text(
+            f"✅ Файл обработан!\n\n"
+            f"➕ Добавлено: <b>{added}</b>\n"
+            f"⏭ Пропущено: <b>{skipped}</b>\n"
+            f"📊 Всего аккаунтов: <b>{len(accounts)}</b>",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        logging.error(f"[FILE] Error: {e}")
+        await msg.edit_text(f"❌ Ошибка обработки файла: {e}")
+
+# ==================== СТАТИСТИКА ====================
+
+@dp.callback_query(F.data == "stats")
+async def cb_stats(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("❌ Только для админа", show_alert=True)
+    
+    total = len(accounts)
+    total_scans = sum(a.get("total_scans", 0) for a in accounts.values())
+    
+    text = f"📊 <b>Статистика</b>\n\n👥 Аккаунтов: <b>{total}</b>\n📷 Всего сканов: <b>{total_scans}</b>"
+    
+    if accounts:
+        text += "\n\n<b>Последние 5 аккаунтов:</b>"
+        for i, (acc_id, acc) in enumerate(list(accounts.items())[-5:]):
+            text += f"\n• {acc['phone']} — сканов: {acc.get('total_scans', 0)}"
+    
+    await callback.message.answer(text, parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data == "my_stats")
+async def cb_my_stats(callback: types.CallbackQuery):
+    total = len(accounts)
+    await callback.answer(f"Доступно аккаунтов: {total}", show_alert=True)
+
+# ==================== СКАНИРОВАНИЕ QR ====================
+
+@dp.callback_query(F.data == "scan_qr")
+async def cb_scan_qr(callback: types.CallbackQuery, state: FSMContext):
+    if not accounts:
+        await callback.answer("❌ Нет доступных аккаунтов", show_alert=True)
+        return
+    
+    logging.info(f"[QR] Scan requested by {callback.from_user.id}")
+    await state.set_state(AuthState.waiting_for_qr)
+    await callback.message.answer(
+        "📷 Отправьте <b>фотографию QR-кода</b>.\n\n"
+        "Бот распознает QR и отсканирует его.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.message(AuthState.waiting_for_qr, F.photo)
+async def handle_qr_photo(message: types.Message, state: FSMContext):
+    msg = await message.answer("⏳ Распознаю QR-код...")
+    logging.info(f"[QR] Photo received from {message.from_user.id}")
+    
+    try:
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        file_bytes = await bot.download_file(file.file_path)
+        
+        files = {'file': ('qr.png', file_bytes.read())}
+        
+        response = requests.post(
+            'https://api.qrserver.com/v1/read-qr-code/',
+            files=files,
+            timeout=10
+        )
+        
+        qr_data = None
+        try:
+            data = response.json()
+            logging.info(f"[QR] API response: {data}")
+            if data and isinstance(data, list) and len(data) > 0:
+                symbol = data[0].get("symbol", [])
+                if symbol and len(symbol) > 0:
+                    qr_data = symbol[0].get("data", "")
+        except:
+            pass
+        
+        if not qr_data:
+            logging.info("[QR] Trying goqr.me API...")
+            response = requests.post(
+                'https://api.goqr.me/read-qr-code/',
+                files=files,
+                timeout=10
+            )
+            try:
+                data = response.json()
+                logging.info(f"[QR] goqr response: {data}")
+                if data and isinstance(data, list) and len(data) > 0:
+                    qr_data = data[0].get("data", "")
+            except:
+                pass
+        
+        if qr_data:
+            logging.info(f"[QR] Decoded data: {qr_data}")
+            await process_qr(message, state, qr_data, msg)
+            return
+        
+        logging.warning("[QR] Both APIs failed")
+        await msg.edit_text("❌ QR-код не найден на фото. Попробуйте другое фото с чётким QR-кодом.")
+        
+    except Exception as e:
+        logging.error(f"[QR] Error: {e}")
+        await msg.edit_text(f"❌ Ошибка распознавания: {e}")
+
+async def process_qr(message: types.Message, state: FSMContext, qr_input: str, msg):
+    logging.info(f"[QR] Processing: {qr_input}")
+    qr_link = qr_input
+    track_id = None
+    
+    if "web.max.ru/link/" in qr_input:
+        try:
+            track_id = qr_input.split("/link/")[1].split("?")[0]
+            logging.info(f"[QR] Extracted track_id from web.max.ru: {track_id}")
+        except:
+            pass
+    
+    if not track_id and "/:auth/" in qr_input:
+        try:
+            track_id = qr_input.split("/:auth/")[1].split("?")[0]
+            logging.info(f"[QR] Extracted track_id from :auth: {track_id}")
+        except:
+            pass
+    
+    if not track_id and "link/" in qr_input.lower():
+        try:
+            parts = qr_input.split("link/")
+            if len(parts) > 1:
+                track_id = parts[1].split("?")[0].split("/")[0]
+                logging.info(f"[QR] Extracted track_id from link: {track_id}")
+        except:
+            pass
+    
+    if not track_id:
+        logging.error(f"[QR] Failed to extract track_id from: {qr_input}")
+        await msg.edit_text(f"❌ Не удалось извлечь ID из QR.\n\nДанные QR: <code>{qr_input[:200]}</code>", parse_mode="HTML")
+        return
+    
+    acc_ids = list(accounts.keys())
+    if not acc_ids:
+        await msg.edit_text("❌ Нет доступных аккаунтов")
+        await state.clear()
+        return
+    
+    acc_id = acc_ids[0]
+    acc = accounts[acc_id]
+    
+    await msg.edit_text(f"⏳ Сканирую QR через {acc['phone']}...")
+    logging.info(f"[QR] Using account: {acc['phone']}")
+    
+    scanner = QRScanner(acc["token"], acc["device_id"])
+    
+    result = None
+    def do_scan():
+        nonlocal result
+        result = scanner.scan(track_id, qr_link)
+    
+    threading.Thread(target=do_scan, daemon=True).start()
+    
+    for _ in range(30):
+        if result: break
+        await asyncio.sleep(0.5)
+    
+    logging.info(f"[QR] Scan result: {result}")
+    
+    if result is None:
+        await msg.edit_text("❌ Таймаут сканирования")
+    elif result.get("success"):
+        pwd = acc.get("password", "")
+        if pwd:
+            text = (
+                f"✅ QR-code успешно отсканирован!\n\n"
+                f"🔐 На аккаунте установлен пароль.\n"
+                f"<b>Пароль от аккаунта:</b> <code>{pwd}</code>"
+            )
+        else:
+            text = (
+                f"✅ QR-code успешно отсканирован!\n\n"
+                f"🔓 Пароль на аккаунте отсутствует."
+            )
+        
+        # Удаляем аккаунт после использования
+        del accounts[acc_id]
+        save_accounts()
+        
+        await msg.edit_text(text, parse_mode="HTML")
+    elif result.get("password_challenge"):
+        pwd = acc.get("password", "")
+        if pwd:
+            await msg.edit_text(
+                f"🔐 Аккаунт {acc['phone']} защищён паролем 2FA.\n\n"
+                f"<b>Пароль:</b> <code>{pwd}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await msg.edit_text(f"🔐 Аккаунт {acc['phone']} защищён паролем 2FA, но пароль не найден в базе.")
+        
+        # Удаляем аккаунт
+        del accounts[acc_id]
+        save_accounts()
+    else:
+        await msg.edit_text(f"❌ Ошибка: {result.get('error', 'неизвестно')}")
+    
+    await state.clear()
+
+async def main():
+    logging.info("QR Scanner Bot запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
