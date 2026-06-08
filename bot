@@ -11,6 +11,7 @@ import struct
 import msgpack
 import zipfile
 import requests
+import re
 from io import BytesIO
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.fsm.context import FSMContext
@@ -21,7 +22,7 @@ from aiogram.types import InlineKeyboardButton
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = "8850529667:AAGMq8dSsrQiNug66fCuJo5l_ru8cMmrenQ"
+BOT_TOKEN = "8758383914:AAEGlke4g7zgNcaa4JZDN6mx8LfArAC5xqM"
 ADMIN_ID = 5804091236
 ACCOUNTS_FILE = "scanner_accounts.json"
 
@@ -259,6 +260,119 @@ class QRScanner:
         finally:
             self.conn.close()
 
+# ==================== ВАЛИДАЦИЯ ТОКЕНОВ ====================
+
+async def validate_token(token: str, device_id: str) -> dict:
+    """Проверяет, рабочий ли токен"""
+    scanner = QRScanner(token, device_id)
+    
+    try:
+        if not scanner.conn.connect():
+            return {"valid": False, "error": "Не удалось подключиться к серверу"}
+        
+        now_ms = int(time.time() * 1000)
+        payload = {
+            "clientSessionId": now_ms & 0x7FFFFFFF,
+            "mt_instanceid": str(uuid.uuid4()),
+            "userAgent": {
+                "deviceType": "ANDROID", "appVersion": "26.17.1",
+                "osVersion": "Android 10", "timezone": "Europe/Moscow",
+                "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
+                "arch": "arm64-v8a", "locale": "ru",
+                "buildNumber": 6712, "deviceName": "Google Pixel 7",
+                "deviceLocale": "ru"
+            },
+            "deviceId": device_id
+        }
+        
+        scanner.conn.send(Packet(Opcode.SESSION_INIT, pack(payload)))
+        await asyncio.sleep(0.5)
+        
+        login_payload = {
+            "token": token,
+            "deviceId": device_id,
+            "userAgent": {
+                "deviceType": "ANDROID", "appVersion": "26.17.1",
+                "osVersion": "Android 10", "timezone": "Europe/Moscow",
+                "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
+                "arch": "arm64-v8a", "locale": "ru",
+                "buildNumber": 6712, "deviceName": "Google Pixel 7",
+                "deviceLocale": "ru"
+            }
+        }
+        
+        resp = scanner.conn.send(Packet(Opcode.LOGIN, pack(login_payload)))
+        
+        if not resp or not resp.payload:
+            return {"valid": False, "error": "Пустой ответ от сервера"}
+        
+        data = unpack(resp.payload)
+        logging.info(f"Validate token response: {data} (type: {type(data)})")
+        
+        if isinstance(data, (int, float)):
+            logging.info(f"Token valid, user ID: {int(data)}")
+            return {"valid": True}
+        
+        if isinstance(data, list):
+            if len(data) > 0:
+                first_item = data[0]
+                if isinstance(first_item, dict):
+                    if first_item.get("passwordChallenge"):
+                        return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
+                    if "error" in first_item:
+                        error_msg = first_item["error"]
+                        if isinstance(error_msg, str):
+                            if "password" in error_msg.lower() or "2fa" in error_msg.lower():
+                                return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_msg}"}
+                            else:
+                                return {"valid": False, "error": error_msg}
+                        return {"valid": False, "error": str(error_msg)}
+                elif isinstance(first_item, (int, float)):
+                    logging.info(f"Token valid, user ID from list: {int(first_item)}")
+                    return {"valid": True}
+            return {"valid": True}
+        
+        if isinstance(data, dict):
+            if data.get("passwordChallenge"):
+                return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
+            
+            if "error" in data:
+                error_msg = data["error"]
+                if isinstance(error_msg, str):
+                    if "password" in error_msg.lower() or "2fa" in error_msg.lower() or "challenge" in error_msg.lower():
+                        return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_msg}"}
+                    else:
+                        return {"valid": False, "error": error_msg}
+                elif isinstance(error_msg, dict):
+                    error_text = error_msg.get("message", str(error_msg))
+                    if "password" in error_text.lower() or "2fa" in error_text.lower():
+                        return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_text}"}
+                    return {"valid": False, "error": error_text}
+                else:
+                    return {"valid": False, "error": str(error_msg)}
+            
+            if "user" in data or "session" in data or "ok" in data or "id" in data:
+                return {"valid": True}
+            
+            if data:
+                logging.info(f"Token valid, dict response without errors")
+                return {"valid": True}
+        
+        if data:
+            data_str = str(data).lower()
+            if "password" in data_str or "2fa" in data_str or "challenge" in data_str:
+                return {"valid": True, "has_2fa": True, "warning": "Обнаружен 2FA в ответе"}
+            if "error" not in data_str and "invalid" not in data_str:
+                return {"valid": True}
+        
+        return {"valid": False, "error": f"Неизвестный формат ответа: {type(data)} - {str(data)[:200]}"}
+        
+    except Exception as e:
+        logging.error(f"Token validation error: {e}")
+        return {"valid": False, "error": str(e)}
+    finally:
+        scanner.conn.close()
+
 # ==================== ДАННЫЕ ====================
 
 class AuthState(StatesGroup):
@@ -321,6 +435,7 @@ def process_content(content: str) -> tuple:
     added = 0
     skipped = 0
     
+    # ===== ФОРМАТ 1: Чистый JSON (массив или объект) =====
     try:
         data = json.loads(content)
         
@@ -341,11 +456,67 @@ def process_content(content: str) -> tuple:
     except:
         pass
     
-    for line in content.strip().split('\n'):
-        line = line.strip()
-        if not line:
+    # ===== ФОРМАТ 2: token {JSON} shortcode + const customPayload = "xxxxx" =====
+    pattern1 = r'([A-Za-z0-9_\-]{100,})\s*(\{[^}]+\})\s*([A-Za-z0-9_\-]{5,30})'
+    matches = re.findall(pattern1, content)
+    
+    if matches:
+        for match in matches:
+            token = match[0]
+            try:
+                device_info = json.loads(match[1])
+                short_code = match[2]
+                
+                device_id = device_info.get("deviceId", str(uuid.uuid4()))
+                device_name = device_info.get("deviceName", "unknown")
+                
+                acc_id = str(uuid.uuid4())[:8]
+                accounts[acc_id] = {
+                    "token": token,
+                    "device_id": device_id,
+                    "phone": f"{device_name}_{short_code}",
+                    "password": "",
+                    "added_at": time.time(),
+                    "total_scans": 0
+                }
+                added += 1
+                logging.info(f"[PARSE] Added token: {device_name} ({acc_id})")
+            except Exception as e:
+                logging.error(f"[PARSE] Error parsing regex match: {e}")
+                skipped += 1
+        
+        # Ищем customPayload
+        pattern2 = r'const\s+customPayload\s*=\s*"(\d+)"'
+        custom_matches = re.findall(pattern2, content)
+        if custom_matches and added > 0:
+            custom_payload = custom_matches[0]
+            last_acc_id = list(accounts.keys())[-1]
+            accounts[last_acc_id]["password"] = custom_payload
+            logging.info(f"[PARSE] Added customPayload as password: {custom_payload}")
+        
+        return added, skipped
+    
+    # ===== ФОРМАТ 3: Построчный парсинг =====
+    lines = content.strip().split('\n')
+    
+    # Сначала собираем customPayload если есть
+    custom_payload = None
+    for line in lines:
+        custom_match = re.search(r'const\s+customPayload\s*=\s*"(\d+)"', line)
+        if custom_match:
+            custom_payload = custom_match.group(1)
+            break
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        # Пропускаем пустые строки и customPayload
+        if not line or line.startswith('const customPayload'):
+            i += 1
             continue
         
+        # ===== Пробуем JSON строку =====
         try:
             data = json.loads(line)
             if isinstance(data, dict):
@@ -353,32 +524,76 @@ def process_content(content: str) -> tuple:
                     added += 1
                 else:
                     skipped += 1
+                i += 1
                 continue
         except:
             pass
         
-        parts = line.split('|')
-        token = parts[0].strip() if len(parts) > 0 else ""
+        # ===== Пробуем формат token|device_id|phone =====
+        if '|' in line:
+            parts = line.split('|')
+            token = parts[0].strip() if len(parts) > 0 else ""
+            if token and len(token) >= 20:
+                device_id = parts[1].strip() if len(parts) > 1 else str(uuid.uuid4())
+                phone = parts[2].strip() if len(parts) > 2 else "unknown"
+                
+                acc_id = str(uuid.uuid4())[:8]
+                accounts[acc_id] = {
+                    "token": token,
+                    "device_id": device_id,
+                    "phone": phone,
+                    "password": custom_payload or "",
+                    "added_at": time.time(),
+                    "total_scans": 0
+                }
+                added += 1
+                i += 1
+                continue
         
-        if not token or len(token) < 20:
-            skipped += 1
-            continue
+        # ===== Пробуем длинный токен (одна строка) =====
+        if len(line) > 100 and not line.startswith('{') and not line.startswith('const'):
+            token = line.split()[0] if ' ' in line else line
+            if len(token) >= 20:
+                acc_id = str(uuid.uuid4())[:8]
+                accounts[acc_id] = {
+                    "token": token,
+                    "device_id": str(uuid.uuid4()),
+                    "phone": "unknown",
+                    "password": custom_payload or "",
+                    "added_at": time.time(),
+                    "total_scans": 0
+                }
+                added += 1
+                i += 1
+                continue
         
-        device_id = parts[1].strip() if len(parts) > 1 else str(uuid.uuid4())
-        phone = parts[2].strip() if len(parts) > 2 else "unknown"
+        # ===== Пробуем формат token device_id phone (через пробел) =====
+        parts = line.split()
+        if len(parts) >= 1:
+            token = parts[0]
+            if len(token) >= 20:
+                device_id = parts[1] if len(parts) > 1 and len(parts[1]) > 10 else str(uuid.uuid4())
+                phone = parts[2] if len(parts) > 2 else "unknown"
+                
+                acc_id = str(uuid.uuid4())[:8]
+                accounts[acc_id] = {
+                    "token": token,
+                    "device_id": device_id,
+                    "phone": phone,
+                    "password": custom_payload or "",
+                    "added_at": time.time(),
+                    "total_scans": 0
+                }
+                added += 1
+                i += 1
+                continue
         
-        acc_id = str(uuid.uuid4())[:8]
-        accounts[acc_id] = {
-            "token": token,
-            "device_id": device_id,
-            "phone": phone,
-            "password": "",
-            "added_at": time.time(),
-            "total_scans": 0
-        }
-        added += 1
+        skipped += 1
+        i += 1
     
     return added, skipped
+
+# ==================== КЛАВИАТУРЫ ====================
 
 def main_keyboard():
     builder = InlineKeyboardBuilder()
@@ -389,7 +604,9 @@ def main_keyboard():
 def admin_keyboard():
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="📷 Отсканировать QR", callback_data="scan_qr"))
+    builder.row(InlineKeyboardButton(text="📊 Мои аккаунты", callback_data="my_stats"))
     builder.row(InlineKeyboardButton(text="➕ Загрузить токены", callback_data="upload_tokens"))
+    builder.row(InlineKeyboardButton(text="🔍 Проверить токены", callback_data="admin_check_tokens"))
     builder.row(InlineKeyboardButton(text="📊 Статистика", callback_data="stats"))
     return builder.as_markup()
 
@@ -454,7 +671,6 @@ async def handle_document(message: types.Message):
                 for inner_file in zf.namelist():
                     if not inner_file.endswith(('.txt', '.json')):
                         continue
-                    
                     try:
                         content = zf.read(inner_file).decode('utf-8')
                         a, s = process_content(content)
@@ -469,16 +685,143 @@ async def handle_document(message: types.Message):
         save_accounts()
         
         await msg.edit_text(
-            f"✅ Файл обработан!\n\n"
-            f"➕ Добавлено: <b>{added}</b>\n"
-            f"⏭ Пропущено: <b>{skipped}</b>\n"
-            f"📊 Всего аккаунтов: <b>{len(accounts)}</b>",
-            parse_mode="HTML"
+            f"✅ Файл обработан!\n"
+            f"➕ Добавлено токенов: {added}\n"
+            f"⏭ Пропущено: {skipped}\n\n"
+            f"🔍 Начинаю проверку..."
         )
+        
+        # Проверяем токены
+        valid = 0
+        invalid = 0
+        twofa = 0
+        to_remove = []
+        twofa_list = []
+        
+        total = len(accounts)
+        checked = 0
+        
+        for acc_id, acc in list(accounts.items()):
+            checked += 1
+            result = await validate_token(acc["token"], acc["device_id"])
+            
+            if result["valid"]:
+                valid += 1
+                if result.get("has_2fa"):
+                    twofa += 1
+                    phone = acc.get("phone", acc_id[:8])
+                    twofa_list.append(f"• {phone}")
+            else:
+                invalid += 1
+                to_remove.append(acc_id)
+                error = result.get("error", "неизвестно")
+                phone = acc.get("phone", acc_id[:8])
+                logging.info(f"Invalid token {phone}: {error}")
+            
+            if checked % 5 == 0 or checked == total:
+                await msg.edit_text(
+                    f"🔍 Проверка токенов...\n"
+                    f"Прогресс: {checked}/{total}\n"
+                    f"✅ Валидных: {valid}\n"
+                    f"🔐 С 2FA: {twofa}\n"
+                    f"❌ Битых: {invalid}",
+                    parse_mode="HTML"
+                )
+        
+        for acc_id in to_remove:
+            del accounts[acc_id]
+        save_accounts()
+        
+        result_text = (
+            f"✅ <b>Проверка завершена!</b>\n\n"
+            f"📦 Всего проверено: <b>{total}</b>\n"
+            f"✅ Валидных: <b>{valid}</b>\n"
+            f"🔐 С 2FA: <b>{twofa}</b>\n"
+            f"❌ Удалено: <b>{invalid}</b>\n"
+            f"📊 Осталось в базе: <b>{len(accounts)}</b>"
+        )
+        
+        if twofa_list:
+            result_text += f"\n\n<b>🔐 Токены с 2FA ({twofa}):</b>\n" + "\n".join(twofa_list[:15])
+            if len(twofa_list) > 15:
+                result_text += f"\n...и ещё {len(twofa_list) - 15}"
+        
+        await msg.edit_text(result_text, parse_mode="HTML")
         
     except Exception as e:
         logging.error(f"[FILE] Error: {e}")
         await msg.edit_text(f"❌ Ошибка обработки файла: {e}")
+
+# ==================== ПРОВЕРКА ТОКЕНОВ ====================
+
+@dp.callback_query(F.data == "admin_check_tokens")
+async def cb_check_tokens(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("❌ Только для админа", show_alert=True)
+    
+    if not accounts:
+        await callback.answer("Нет токенов для проверки", show_alert=True)
+        return
+    
+    await callback.answer("🔍 Начинаю проверку...")
+    msg = await callback.message.answer(f"🔍 Проверяю <b>{len(accounts)}</b> токенов...", parse_mode="HTML")
+    
+    valid_count = 0
+    invalid_count = 0
+    twofa_count = 0
+    invalid_tokens = []
+    twofa_list = []
+    
+    total = len(accounts)
+    checked = 0
+    
+    for acc_id, acc in list(accounts.items()):
+        checked += 1
+        result = await validate_token(acc["token"], acc["device_id"])
+        
+        if result["valid"]:
+            valid_count += 1
+            if result.get("has_2fa"):
+                twofa_count += 1
+                phone = acc.get("phone", acc_id[:8])
+                twofa_list.append(f"• {phone}")
+        else:
+            invalid_count += 1
+            phone = acc.get("phone", acc_id[:8])
+            error = result.get("error", "неизвестная ошибка")
+            invalid_tokens.append(f"• <code>{phone}</code>: {error}")
+            del accounts[acc_id]
+        
+        if checked % 5 == 0 or checked == total:
+            await msg.edit_text(
+                f"🔍 Проверка: <b>{checked}</b>/{total}\n"
+                f"✅ Валидных: {valid_count}\n"
+                f"🔐 С 2FA: {twofa_count}\n"
+                f"❌ Битых: {invalid_count}",
+                parse_mode="HTML"
+            )
+    
+    save_accounts()
+    
+    text = (
+        f"📊 <b>Проверка завершена!</b>\n\n"
+        f"✅ Рабочих: <b>{valid_count}</b>\n"
+        f"🔐 С 2FA: <b>{twofa_count}</b>\n"
+        f"❌ Удалено: <b>{invalid_count}</b>\n"
+        f"📊 Осталось в базе: <b>{len(accounts)}</b>"
+    )
+    
+    if twofa_list:
+        text += f"\n\n<b>🔐 Токены с 2FA:</b>\n" + "\n".join(twofa_list[:15])
+        if len(twofa_list) > 15:
+            text += f"\n...и ещё {len(twofa_list) - 15}"
+    
+    if invalid_tokens:
+        text += f"\n\n<b>❌ Удалённые токены:</b>\n" + "\n".join(invalid_tokens[:10])
+        if len(invalid_tokens) > 10:
+            text += f"\n...и ещё {len(invalid_tokens) - 10}"
+    
+    await msg.edit_text(text, parse_mode="HTML")
 
 # ==================== СТАТИСТИКА ====================
 
